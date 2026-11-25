@@ -205,17 +205,44 @@ def procesar_alerta_movimiento(payload_str):
         ).start()
 
 def on_connect(client, userdata, flags, reason_code, properties=None):
-    print(f"[MQTT] Conectado al bróker (código: {reason_code})")
+    print(f"[MQTT] Conectado al bróker (código: {reason_code})", flush=True)
     client.subscribe(TOPIC_CONFIRMACION)
     client.subscribe(TOPIC_ALERTA)
 
 def on_message(client, userdata, msg):
     payload_str = msg.payload.decode("utf-8", errors="replace")
-    print(f"[MQTT RX <- {msg.topic}] {payload_str}")
+    print(f"[MQTT RX <- {msg.topic}] {payload_str}", flush=True)
     if msg.topic == TOPIC_CONFIRMACION:
         procesar_confirmacion_luz(payload_str)
     elif msg.topic == TOPIC_ALERTA:
         procesar_alerta_movimiento(payload_str)
+
+_mqtt_pid = None
+mqtt_client = None
+
+def asegurar_mqtt():
+    global mqtt_client, _mqtt_pid
+    pid_actual = os.getpid()
+    if mqtt_client is None or _mqtt_pid != pid_actual or not mqtt_client.is_connected():
+        print(f"[MQTT] Conectando cliente MQTT en proceso PID {pid_actual}...", flush=True)
+        if mqtt_client is not None and _mqtt_pid == pid_actual:
+            try:
+                mqtt_client.loop_stop()
+            except Exception:
+                pass
+        mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
+        mqtt_client.on_connect = on_connect
+        mqtt_client.on_message = on_message
+        try:
+            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
+            mqtt_client.loop_start()
+            _mqtt_pid = pid_actual
+            print(f"[MQTT] loop_start() activo en PID {pid_actual}", flush=True)
+        except Exception as exc:
+            print(f"[MQTT][ERROR] Fallo al conectar al broker en PID {pid_actual}: {exc}", flush=True)
+    return mqtt_client
+
+asegurar_mqtt()
 
 def verificar_timeouts():
     ahora = time.time()
@@ -243,12 +270,6 @@ def vigilante_timeouts():
             print(f"[VIGILANTE][ERROR] {e}", flush=True)
 
 threading.Thread(target=vigilante_timeouts, daemon=True).start()
-
-mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2)
-mqtt_client.on_connect = on_connect
-mqtt_client.on_message = on_message
-mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-mqtt_client.loop_start()
 
 # ==========================================
 # 3. PLANTILLAS HTML (LOGIN Y DASHBOARD)
@@ -460,9 +481,19 @@ def controlar_luz():
         estado_sistema["mensaje_transaccion"] = f"⏳ Esperando confirmación del nodo para [{id_accion}]..."
 
     mensaje_json = json.dumps(comando_mqtt)
-    mqtt_client.publish(TOPIC_COMANDO, mensaje_json)
-    print(f"[MQTT TX -> {TOPIC_COMANDO}] {mensaje_json}", flush=True)
-    return jsonify({"enviado": True, "comando": comando_mqtt})
+    client = asegurar_mqtt()
+    info = client.publish(TOPIC_COMANDO, mensaje_json)
+    try:
+        info.wait_for_publish(timeout=2.0)
+        enviado_ok = info.is_published()
+    except Exception:
+        enviado_ok = False
+    print(f"[MQTT TX -> {TOPIC_COMANDO}] {mensaje_json} (enviado_a_broker={enviado_ok})", flush=True)
+    return jsonify({"enviado": enviado_ok, "comando": comando_mqtt})
+
+@app.before_request
+def antes_de_peticion():
+    asegurar_mqtt()
 
 @app.route("/api/estado")
 @login_requerido
