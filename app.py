@@ -4,6 +4,8 @@ import smtplib
 import time
 import uuid
 import threading
+import urllib.request
+import urllib.error
 from email.message import EmailMessage
 from functools import wraps
 from flask import Flask, request, redirect, url_for, session, jsonify, render_template_string
@@ -32,20 +34,31 @@ TIMEOUT_SEGUNDOS = 5.0
 COOLDOWN_ALERTA_SEGUNDOS = 30.0
 
 # ==========================================
-# 2B. CONFIGURACIÓN SMTP GMAIL (Requerimiento 4)
+# 2B. CONFIGURACIÓN NOTIFICACIONES (RESEND HTTPS / SMTP)
 # ==========================================
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
 SMTP_HOST = "smtp.gmail.com"
 SMTP_PORT = 465
 SMTP_USER = os.environ.get("SMTP_USER", "").strip()
 SMTP_PASS = os.environ.get("SMTP_PASS", "").strip()
-ALERT_EMAIL_TO = os.environ.get("ALERT_EMAIL_TO", "").strip() or SMTP_USER
-SMTP_CONFIGURADO = bool(SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO)
+ALERT_EMAIL_TO = (
+    os.environ.get("ALERT_EMAIL_TO", "").strip()
+    or SMTP_USER
+    or "juanfeliperojasabc12@gmail.com"
+)
 
-if not SMTP_CONFIGURADO:
+EMAIL_CONFIGURADO = bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASS))
+
+if not EMAIL_CONFIGURADO:
     print(
-        "[SMTP][AVISO] Variables SMTP_USER y/o SMTP_PASS no configuradas. "
-        "Las alertas de movimiento se registrarán en consola y panel web, pero no se enviarán correos."
+        "[CORREO][AVISO] Variables RESEND_API_KEY o credenciales SMTP no configuradas. "
+        "Las alertas de movimiento se registrarán en consola y panel web, pero no se enviarán correos.",
+        flush=True
     )
+elif RESEND_API_KEY:
+    print(f"[RESEND] Notificaciones vía API HTTPS (puerto 443) activas. Destino: {ALERT_EMAIL_TO}", flush=True)
+else:
+    print(f"[SMTP] Notificaciones vía Gmail SMTP activas. Destino: {ALERT_EMAIL_TO}", flush=True)
 
 lock_estado = threading.Lock()
 comandos_pendientes = {}  # { id_accion: {"timestamp": float, "accion": str} }
@@ -78,41 +91,79 @@ def registrar_historial(tipo, detalle):
     })
     estado_sistema["historial"] = estado_sistema["historial"][:12]
 
-def enviar_correo_alerta_async(evento, sensor, origen, timestamp_str, payload_str):
-    try:
-        msg = EmailMessage()
-        msg["Subject"] = f"[Alerta IoT] Movimiento detectado ({sensor})"
-        msg["From"] = SMTP_USER
-        msg["To"] = ALERT_EMAIL_TO
-        msg.set_content(
-            "Se ha detectado una alerta de movimiento en el sistema IoT.\n\n"
-            f"- Evento: {evento}\n"
-            f"- Sensor: {sensor}\n"
-            f"- Origen: {origen}\n"
-            f"- Fecha y hora: {timestamp_str}\n"
-            f"- Tópico MQTT: {TOPIC_ALERTA}\n"
-            f"- Payload recibido: {payload_str}\n"
-        )
+def enviar_correo_resend(destinatario, asunto, contenido_texto):
+    url = "https://api.resend.com/emails"
+    payload = {
+        "from": "Alerta IoT UR <onboarding@resend.dev>",
+        "to": [destinatario],
+        "subject": asunto,
+        "text": contenido_texto
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+            "User-Agent": "Flask-IoT-UR"
+        },
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read().decode("utf-8"))
 
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
-            smtp.login(SMTP_USER, SMTP_PASS)
-            smtp.send_message(msg)
+def enviar_correo_alerta_async(evento, sensor, origen, timestamp_str, payload_str):
+    destinatario = ALERT_EMAIL_TO
+    asunto = f"[Alerta IoT] Movimiento detectado ({sensor})"
+    cuerpo = (
+        "Se ha detectado una alerta de movimiento en el sistema IoT.\n\n"
+        f"- Evento: {evento}\n"
+        f"- Sensor: {sensor}\n"
+        f"- Origen: {origen}\n"
+        f"- Fecha y hora: {timestamp_str}\n"
+        f"- Tópico MQTT: {TOPIC_ALERTA}\n"
+        f"- Payload recibido: {payload_str}\n"
+    )
+    try:
+        if RESEND_API_KEY:
+            print(f"[RESEND] Enviando correo a {destinatario} vía HTTPS (puerto 443)...", flush=True)
+            res = enviar_correo_resend(destinatario, asunto, cuerpo)
+            print(f"[RESEND] Correo de alerta enviado exitosamente a {destinatario} (ID: {res.get('id', 'OK')})", flush=True)
+        else:
+            print(f"[SMTP] Enviando correo a {destinatario} vía SMTP...", flush=True)
+            msg = EmailMessage()
+            msg["Subject"] = asunto
+            msg["From"] = SMTP_USER
+            msg["To"] = destinatario
+            msg.set_content(cuerpo)
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as smtp:
+                smtp.login(SMTP_USER, SMTP_PASS)
+                smtp.send_message(msg)
+            print(f"[SMTP] Correo de alerta enviado a {destinatario}", flush=True)
 
         with lock_estado:
             estado_sistema["ultima_alerta_movimiento"]["estado_correo"] = "ENVIADO"
             estado_sistema["ultima_alerta_movimiento"]["detalle_correo"] = (
-                f"Correo enviado a {ALERT_EMAIL_TO} ({timestamp_str})"
+                f"Correo enviado a {destinatario} ({timestamp_str})"
             )
-            registrar_historial("MAIL_OK", f"Correo enviado a {ALERT_EMAIL_TO}")
-        print(f"[SMTP] Correo de alerta enviado a {ALERT_EMAIL_TO}")
+            registrar_historial("MAIL_OK", f"Correo enviado a {destinatario}")
+    except urllib.error.HTTPError as he:
+        err_body = he.read().decode("utf-8", errors="replace")
+        msg_err = f"HTTP {he.code}: {err_body}"
+        with lock_estado:
+            estado_sistema["ultima_alerta_movimiento"]["estado_correo"] = "ERROR"
+            estado_sistema["ultima_alerta_movimiento"]["detalle_correo"] = f"Error Resend: {msg_err}"
+            registrar_historial("MAIL_ERR", f"Error Resend: {he.code}")
+        print(f"[RESEND][ERROR] {msg_err}", flush=True)
     except Exception as exc:
         with lock_estado:
             estado_sistema["ultima_alerta_movimiento"]["estado_correo"] = "ERROR"
             estado_sistema["ultima_alerta_movimiento"]["detalle_correo"] = (
                 f"Error al enviar correo: {exc}"
             )
-            registrar_historial("MAIL_ERR", f"Error SMTP: {exc}")
-        print(f"[SMTP][ERROR] No se pudo enviar el correo de alerta: {exc}")
+            registrar_historial("MAIL_ERR", f"Error correo: {exc}")
+        print(f"[CORREO][ERROR] No se pudo enviar el correo de alerta: {exc}", flush=True)
 
 def procesar_confirmacion_luz(payload_str):
     try:
@@ -168,9 +219,9 @@ def procesar_alerta_movimiento(payload_str):
             return
 
         ultima_alerta_enviada_ts = ahora
-        smtp_ok = bool(SMTP_USER and SMTP_PASS and ALERT_EMAIL_TO)
+        correo_ok = bool(RESEND_API_KEY or (SMTP_USER and SMTP_PASS))
 
-        if smtp_ok:
+        if correo_ok:
             estado_sistema["ultima_alerta_movimiento"] = {
                 "detectada": True,
                 "timestamp": timestamp_str,
@@ -181,7 +232,8 @@ def procesar_alerta_movimiento(payload_str):
                 "detalle_correo": f"Enviando notificación a {ALERT_EMAIL_TO}...",
                 "payload_raw": payload_str
             }
-            registrar_historial("PIR_ALERTA", f"{evento} ({sensor}) -> Enviando correo a {ALERT_EMAIL_TO}")
+            metodo_envio = "Resend (HTTPS)" if RESEND_API_KEY else "Gmail (SMTP)"
+            registrar_historial("PIR_ALERTA", f"{evento} ({sensor}) -> Enviando por {metodo_envio} a {ALERT_EMAIL_TO}")
             lanzar_hilo = True
         else:
             estado_sistema["ultima_alerta_movimiento"] = {
@@ -191,11 +243,11 @@ def procesar_alerta_movimiento(payload_str):
                 "sensor": sensor,
                 "origen": origen,
                 "estado_correo": "NO_CONFIGURADO",
-                "detalle_correo": "SMTP_USER / SMTP_PASS no configurados; correo no enviado.",
+                "detalle_correo": "Ni RESEND_API_KEY ni credenciales SMTP configuradas; correo no enviado.",
                 "payload_raw": payload_str
             }
-            registrar_historial("PIR_ALERTA", f"{evento} ({sensor}) -> Correo omitido (SMTP no configurado)")
-            print("[SMTP][AVISO] Alerta recibida, pero falta configurar SMTP_USER/SMTP_PASS para enviar el correo.")
+            registrar_historial("PIR_ALERTA", f"{evento} ({sensor}) -> Correo omitido (no configurado)")
+            print("[CORREO][AVISO] Alerta recibida, pero falta configurar RESEND_API_KEY o credenciales SMTP.", flush=True)
 
     if lanzar_hilo:
         threading.Thread(
