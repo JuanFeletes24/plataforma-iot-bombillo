@@ -217,23 +217,30 @@ def on_message(client, userdata, msg):
     elif msg.topic == TOPIC_ALERTA:
         procesar_alerta_movimiento(payload_str)
 
-# Hilo vigilante que verifica comandos que superen los 5 segundos sin ACK
+def verificar_timeouts():
+    ahora = time.time()
+    expirados = [
+        cid for cid, info in list(comandos_pendientes.items())
+        if (ahora - info["timestamp"]) > TIMEOUT_SEGUNDOS
+    ]
+    for cid in expirados:
+        info = comandos_pendientes.pop(cid, None)
+        if info:
+            msg_timeout = f"❌ TIMEOUT (>{int(TIMEOUT_SEGUNDOS)}s): El nodo no confirmó [{cid}] ({info['accion']})"
+            print(f"[TIMEOUT] {msg_timeout}", flush=True)
+            estado_sistema["estado_transaccion"] = "TIMEOUT"
+            estado_sistema["mensaje_transaccion"] = msg_timeout
+            registrar_historial("TIMEOUT", msg_timeout)
+
+# Hilo vigilante en segundo plano (respaldo)
 def vigilante_timeouts():
     while True:
-        time.sleep(0.25)
-        ahora = time.time()
-        with lock_estado:
-            expirados = [
-                cid for cid, info in comandos_pendientes.items()
-                if (ahora - info["timestamp"]) > TIMEOUT_SEGUNDOS
-            ]
-            for cid in expirados:
-                info = comandos_pendientes.pop(cid)
-                msg_timeout = f"❌ TIMEOUT (>{int(TIMEOUT_SEGUNDOS)}s): El nodo no confirmó [{cid}] ({info['accion']})"
-                print(f"[TIMEOUT] {msg_timeout}")
-                estado_sistema["estado_transaccion"] = "TIMEOUT"
-                estado_sistema["mensaje_transaccion"] = msg_timeout
-                registrar_historial("TIMEOUT", msg_timeout)
+        time.sleep(0.5)
+        try:
+            with lock_estado:
+                verificar_timeouts()
+        except Exception as e:
+            print(f"[VIGILANTE][ERROR] {e}", flush=True)
 
 threading.Thread(target=vigilante_timeouts, daemon=True).start()
 
@@ -454,13 +461,14 @@ def controlar_luz():
 
     mensaje_json = json.dumps(comando_mqtt)
     mqtt_client.publish(TOPIC_COMANDO, mensaje_json)
-    print(f"[MQTT TX -> {TOPIC_COMANDO}] {mensaje_json}")
+    print(f"[MQTT TX -> {TOPIC_COMANDO}] {mensaje_json}", flush=True)
     return jsonify({"enviado": True, "comando": comando_mqtt})
 
 @app.route("/api/estado")
 @login_requerido
 def obtener_estado():
     with lock_estado:
+        verificar_timeouts()
         return jsonify(estado_sistema)
 
 if __name__ == "__main__":
